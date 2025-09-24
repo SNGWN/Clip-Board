@@ -147,36 +147,6 @@ final class ClipboardWatcher {
     }
 }
 
-// MARK: - Paste Helper
-
-final class PasteHelper {
-    private static var warnedAccessibility = false
-
-    static func paste(text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-
-        guard AXIsProcessTrusted() else {
-            if !warnedAccessibility {
-                warnedAccessibility = true
-                print("ℹ️ Grant Accessibility permissions to enable automatic paste (System Settings > Privacy & Security > Accessibility).")
-            }
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            guard let src = CGEventSource(stateID: .combinedSessionState) else { return }
-            let down = CGEvent(keyboardEventSource: src, virtualKey: UInt16(kVK_ANSI_V), keyDown: true)
-            down?.flags = .maskCommand
-            down?.post(tap: .cghidEventTap)
-
-            let up = CGEvent(keyboardEventSource: src, virtualKey: UInt16(kVK_ANSI_V), keyDown: false)
-            up?.flags = .maskCommand
-            up?.post(tap: .cghidEventTap)
-        }
-    }
-}
-
 // MARK: - Hotkey Manager
 
 final class HotkeyManager {

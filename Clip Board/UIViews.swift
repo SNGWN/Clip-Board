@@ -14,6 +14,14 @@ import AppKit
 import Foundation
 import Combine
 
+// Semantic key codes to avoid magic numbers
+private enum KeyCode {
+    static let down: UInt16 = 125
+    static let up: UInt16 = 126
+    static let `return`: UInt16 = 36
+    static let escape: UInt16 = 53
+}
+
 // MARK: - KeyDown Handling View
 
 /// A lightweight NSViewRepresentable that installs a local keyDown monitor while present in the view hierarchy.
@@ -221,30 +229,55 @@ struct FocusRinglessTextField: NSViewRepresentable {
 struct ContentView: View {
     @EnvironmentObject var itemsVM: ItemsViewModel
     @State private var searchText: String = ""
+    @State private var debouncedSearchText: String = ""
+    @State private var searchDebounceTask: DispatchWorkItem? = nil
     @State private var selectedID: UUID? = nil
-    @State private var copiedID: UUID? = nil
+    @State private var copiedTimestamps: [UUID: Date] = [:]
     @State private var hoverID: UUID? = nil
     @FocusState private var searchFocused: Bool
-
     @State private var visibleLimit: Int = 30
     private let maxVisible: Int = 200
+    @State private var keyboardNavigated: Bool = false
+    private let copyHighlightDuration: TimeInterval = 0.6
 
-    /// Items filtered by the current `searchText`. Returns all items when the query is empty.
+    // Filtered items (debounced search)
     private var filteredItems: [ClipItem] {
         let base = itemsVM.items
-        guard !searchText.isEmpty else { return base }
-        return base.filter { $0.text.localizedCaseInsensitiveContains(searchText) }
+        let q = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return base }
+        return base.filter { $0.text.localizedCaseInsensitiveContains(q) }
     }
-
     private var pinnedItems: [ClipItem] { filteredItems.filter { $0.pinned } }
     private var unpinnedItems: [ClipItem] { filteredItems.filter { !$0.pinned } }
     private var orderedItems: [ClipItem] { pinnedItems + unpinnedItems }
-
-    private var displayItems: [ClipItem] {
-        Array(orderedItems.prefix(min(visibleLimit, maxVisible)))
-    }
+    private var displayItems: [ClipItem] { Array(orderedItems.prefix(min(visibleLimit, maxVisible))) }
     private var displayPinned: [ClipItem] { displayItems.filter { $0.pinned } }
     private var displayUnpinned: [ClipItem] { displayItems.filter { !$0.pinned } }
+
+    private func isRecentlyCopied(_ id: UUID) -> Bool {
+        guard let ts = copiedTimestamps[id] else { return false }
+        return Date().timeIntervalSince(ts) < copyHighlightDuration
+    }
+    private func scheduleCopiedCleanup(for id: UUID) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + copyHighlightDuration) {
+            if let ts = copiedTimestamps[id], Date().timeIntervalSince(ts) >= copyHighlightDuration {
+                copiedTimestamps.removeValue(forKey: id)
+            }
+        }
+    }
+
+    private enum RowAction { case copy }
+    private func perform(action: RowAction, id: UUID) {
+        guard let item = filteredItems.first(where: { $0.id == id }) else { return }
+        switch action {
+        case .copy:
+            NSPasteboard.general.copyString(item.text)
+        }
+        selectedID = id
+        copiedTimestamps[id] = Date()
+        scheduleCopiedCleanup(for: id)
+        HistoryWindowController.shared.close()
+    }
 
     @ViewBuilder
     private func rows(for items: [ClipItem]) -> some View {
@@ -252,43 +285,28 @@ struct ContentView: View {
             ClipRow(
                 item: item,
                 isSelected: selectedID == item.id,
-                isCopied: copiedID == item.id
+                isCopied: isRecentlyCopied(item.id)
             )
+            .id(item.id)
             .contentShape(Rectangle())
-            .onTapGesture { selectAndCopyByID(item.id) }
+            .onTapGesture { perform(action: .copy, id: item.id) }
             .onHover { hovering in
-                if hovering {
-                    hoverID = item.id
-                    selectedID = item.id
-                } else if hoverID == item.id {
-                    hoverID = nil
-                    if selectedID == item.id { selectedID = nil }
-                }
+                if hovering { hoverID = item.id; selectedID = item.id } else if hoverID == item.id { hoverID = nil; if selectedID == item.id { selectedID = nil } }
             }
             .contextMenu {
-                Button(item.pinned ? "Unpin" : "Pin") {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        itemsVM.togglePin(item.id)
-                    }
-                }
-                Button("Copy") {
-                    NSPasteboard.general.copyString(item.text)
-                }
-                Button("Paste") {
-                    pasteItemByID(item.id)
-                }
+                Button(item.pinned ? "Unpin" : "Pin") { withAnimation(.easeInOut(duration: 0.15)) { itemsVM.togglePin(item.id) } }
+                Button("Copy") { perform(action: .copy, id: item.id) }
                 Divider()
                 Button("Delete", role: .destructive) {
                     itemsVM.deleteItem(item.id)
                     if selectedID == item.id { selectedID = nil }
+                    copiedTimestamps.removeValue(forKey: item.id)
                 }
             }
             .onAppear {
                 if let last = displayItems.last, last.id == item.id {
                     let total = orderedItems.count
-                    if visibleLimit < min(total, maxVisible) {
-                        visibleLimit = min(visibleLimit + 30, min(total, maxVisible))
-                    }
+                    if visibleLimit < min(total, maxVisible) { visibleLimit = min(visibleLimit + 30, min(total, maxVisible)) }
                 }
             }
         }
@@ -296,13 +314,10 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Header
             HStack(spacing: 8) {
-                Image(systemName: "doc.on.clipboard")
-                    .imageScale(.medium)
-                    .foregroundStyle(.secondary)
-                Text("Clipboard")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                Image(systemName: "doc.on.clipboard").imageScale(.medium).foregroundStyle(.secondary)
+                Text("Clipboard").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                 Spacer()
             }
             .padding(.horizontal, HistoryUI.innerHorizontal)
@@ -313,130 +328,78 @@ struct ContentView: View {
                 .padding(.horizontal, HistoryUI.innerHorizontal)
                 .padding(.bottom, 8)
 
-            Divider()
-                .opacity(0.6)
-                .padding(.bottom, 6)
+            Divider().opacity(0.6).padding(.bottom, 6)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    if displayItems.isEmpty {
-                        emptyState
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .padding(.vertical, 6)
-                    } else {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            // Pinned section
-                            if !displayPinned.isEmpty {
-                                rows(for: displayPinned)
-
-                                // Divider between pinned and others
-                                Divider()
-                                    .opacity(0.6)
-                                    .padding(.vertical, 2)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if displayItems.isEmpty {
+                            emptyState
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 6)
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: 8) {
+                                if !displayPinned.isEmpty {
+                                    rows(for: displayPinned)
+                                    Divider().opacity(0.6).padding(.vertical, 2)
+                                }
+                                rows(for: displayUnpinned)
                             }
-
-                            // Unpinned section
-                            rows(for: displayUnpinned)
+                            .padding(.horizontal, 7)
+                            .padding(.bottom, 56)
                         }
-                        .padding(.horizontal, 7)
-                        // Give extra bottom inset so the last item can scroll fully into view
-                        .padding(.bottom, 56)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .coordinateSpace(name: "historyScroll")
-            .frame(width: HistoryUI.contentWidth, height: HistoryUI.contentHeight)
-            .scrollIndicators(.hidden)
-            .safeAreaInset(edge: .bottom) {
-                Color.clear.frame(height: 8)
-            }
-            .transaction { txn in
-                // Prevent implicit animations on bulk updates to avoid jitter
-                txn.animation = nil
-            }
-            .onKeyDown(handleKeyEvent(_:))
-        }
-        .onAppear {
-            // Defer focus slightly to ensure window is key and view is in hierarchy
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                self.searchFocused = true
+                .coordinateSpace(name: "historyScroll")
+                .frame(width: HistoryUI.contentWidth, height: HistoryUI.contentHeight)
+                .scrollIndicators(.hidden)
+                .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 8) }
+                .transaction { $0.animation = nil }
+                .onChange(of: selectedID) { id in
+                    guard keyboardNavigated, let id else { return }
+                    keyboardNavigated = false
+                    withAnimation(.easeInOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) }
+                }
+                .onKeyDown(handleKeyEvent(_:))
             }
         }
-        .onChange(of: searchText) { _ in
-            visibleLimit = 30
+        .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { searchFocused = true } }
+        .onChange(of: searchText) { newValue in
+            searchDebounceTask?.cancel()
+            if newValue.isEmpty { debouncedSearchText = ""; visibleLimit = 30; return }
+            let task = DispatchWorkItem { debouncedSearchText = newValue; visibleLimit = 30 }
+            searchDebounceTask = task
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: task)
         }
     }
 
-    private func indexInFiltered(for id: UUID) -> Int? {
-        filteredItems.firstIndex { $0.id == id }
-    }
-
-    private func selectAndCopyByID(_ id: UUID) {
-        guard let idx = indexInFiltered(for: id) else { return }
-        selectedID = id
-        copyItem(at: idx)
-        // HistoryWindowController.shared.close() // removed per instructions
-    }
-
-    private func pasteItemByID(_ id: UUID) {
-        guard let idx = indexInFiltered(for: id) else { return }
-        copiedID = id
-        PasteHelper.paste(text: filteredItems[idx].text)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [id] in
-            if copiedID == id { copiedID = nil }
-        }
-        // HistoryWindowController.shared.close() // removed per instructions
-    }
-
-    /// Shown when no items match the current filter.
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Image(systemName: "doc.on.clipboard")
-                .font(.system(size: 24))
-                .foregroundStyle(.secondary)
-            Text("No items found")
-                .foregroundStyle(.secondary)
-                .font(.footnote)
-        }
-        .padding(.vertical, 18)
+            Image(systemName: "doc.on.clipboard").font(.system(size: 24)).foregroundStyle(.secondary)
+            Text("No items found").foregroundStyle(.secondary).font(.footnote)
+        }.padding(.vertical, 18)
     }
 
-    /// Search field with clear button and a trailing "Clear" action to remove unpinned history.
     private var searchBar: some View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundColor(.secondary)
-
-                FocusRinglessTextField(title: "Search clipboard",
-                                       text: $searchText,
-                                       isFocused: searchFocused)
+                Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                FocusRinglessTextField(title: "Search clipboard", text: $searchText, isFocused: searchFocused)
                     .frame(maxWidth: .infinity, alignment: .leading)
-
                 if !searchText.isEmpty {
                     Button(action: { searchText = "" }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.secondary.opacity(0.9))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear search")
+                        Image(systemName: "xmark.circle.fill").foregroundColor(.secondary.opacity(0.9))
+                    }.buttonStyle(.plain).help("Clear search")
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, HistoryUI.innerVertical)
-            .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Color(NSColor.controlBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .stroke(Color.white.opacity(0.06))
-            )
+            .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color(NSColor.controlBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.white.opacity(0.06)))
 
             Button(role: .destructive, action: { clearHistory(removePinned: false) }) {
-                Image(systemName: "trash")
-                Text("Clear")
+                Image(systemName: "trash"); Text("Clear")
             }
             .font(.footnote)
             .buttonStyle(.bordered)
@@ -445,89 +408,33 @@ struct ContentView: View {
         }
     }
 
-    /// Clears clipboard history via the view model.
-    /// - Parameter removePinned: When true, also removes pinned entries.
     private func clearHistory(removePinned: Bool) {
         itemsVM.clearHistory(removePinned: removePinned)
         selectedID = nil
-        copiedID = nil
+        copiedTimestamps.removeAll()
         searchText = ""
     }
 
-    /// Selects the item at `index`, copies it to the pasteboard, and closes the window.
-    private func selectAndCopy(_ index: Int) {
-        guard filteredItems.indices.contains(index) else { return }
-        selectedID = filteredItems[index].id
-        copyItem(at: index)
-        // HistoryWindowController.shared.close() // removed per instructions
-    }
-
-    /// Copies the item text at `index` to the pasteboard and closes the window.
-    private func copyItem(at index: Int) {
-        guard filteredItems.indices.contains(index) else { return }
-        NSPasteboard.general.copyString(filteredItems[index].text)
-        copiedID = filteredItems[index].id
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [index] in
-            if let id = copiedID, filteredItems.indices.contains(index), filteredItems[index].id == id {
-                copiedID = nil
-            }
-        }
-        // Close the history window after copying
-        HistoryWindowController.shared.close()
-    }
-
-    /// Pastes the item at `index` using `PasteHelper` and closes the window.
-    private func pasteItem(at index: Int) {
-        guard filteredItems.indices.contains(index) else { return }
-        PasteHelper.paste(text: filteredItems[index].text)
-        copiedID = filteredItems[index].id
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [index] in
-            if let id = copiedID, filteredItems.indices.contains(index), filteredItems[index].id == id {
-                copiedID = nil
-            }
-        }
-        // Close the history window after pasting
-        HistoryWindowController.shared.close()
-    }
-
-    /// Handles arrow/return/escape keys for list navigation and actions.
-    /// - Up/Down: move selection
-    /// - Return: copy selected
-    /// - Escape: clear search or close panel
+    // Keyboard: Up/Down selects, Return copies selected (and closes), Esc clears or closes
     private func handleKeyEvent(_ event: NSEvent) {
         switch event.keyCode {
-        case 125: // down
+        case KeyCode.down:
             guard !orderedItems.isEmpty else { return }
+            keyboardNavigated = true
             if let currentID = selectedID, let idx = orderedItems.firstIndex(where: { $0.id == currentID }) {
-                let next = min(idx + 1, orderedItems.count - 1)
-                selectedID = orderedItems[next].id
-            } else {
-                selectedID = orderedItems.first?.id
-            }
-        case 126: // up
+                selectedID = orderedItems[min(idx + 1, orderedItems.count - 1)].id
+            } else { selectedID = orderedItems.first?.id }
+        case KeyCode.up:
             guard !orderedItems.isEmpty else { return }
+            keyboardNavigated = true
             if let currentID = selectedID, let idx = orderedItems.firstIndex(where: { $0.id == currentID }) {
-                let prev = max(idx - 1, 0)
-                selectedID = orderedItems[prev].id
-            } else {
-                selectedID = orderedItems.last?.id
-            }
-        case 36: // return
-            if let id = selectedID, let idx = orderedItems.firstIndex(where: { $0.id == id }) {
-                // Map orderedItems index to filteredItems index for copyItem(at:)
-                if let filteredIdx = filteredItems.firstIndex(where: { $0.id == orderedItems[idx].id }) {
-                    copyItem(at: filteredIdx)
-                }
-            }
-        case 53: // escape
-            if !searchText.isEmpty {
-                searchText = ""
-            } else {
-                selectedID = nil
-                HistoryWindowController.shared.close()
-            }
-        default:
-            break
+                selectedID = orderedItems[max(idx - 1, 0)].id
+            } else { selectedID = orderedItems.last?.id }
+        case KeyCode.return:
+            if let id = selectedID { perform(action: .copy, id: id) }
+        case KeyCode.escape:
+            if !searchText.isEmpty { searchText = "" } else { selectedID = nil; HistoryWindowController.shared.close() }
+        default: break
         }
     }
 }
